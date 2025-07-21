@@ -2,7 +2,7 @@
 
 ## 개요
 
-본 문서는 IR-CSaaS MVP의 백엔드 중심 시스템 설계를 정의합니다. Supabase를 백엔드 인프라로 활용하여 빠른 MVP 개발과 확장 가능한 아키텍처를 구현합니다.
+본 문서는 IR-CSaaS MVP의 백엔드 중심 시스템 설계를 정의합니다. Java Spring Boot를 백엔드로, PostgreSQL을 데이터베이스로 활용하여 확장 가능한 엔터프라이즈급 아키텍처를 구현합니다.
 
 ## 아키텍처
 
@@ -10,7 +10,7 @@
 
 ```
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   Next.js App   │────│   Supabase API   │────│   PostgreSQL    │
+│   Next.js App   │────│  Spring Boot API │────│   PostgreSQL    │
 │   (Frontend)    │    │   (Backend)      │    │   (Database)    │
 └─────────────────┘    └──────────────────┘    └─────────────────┘
          │                       │                       │
@@ -18,8 +18,8 @@
          │              │                 │             │
          │              ▼                 ▼             │
          │    ┌─────────────────┐ ┌─────────────────┐   │
-         │    │   Auth Service  │ │  Real-time      │   │
-         │    │   (Supabase)    │ │  Subscriptions  │   │
+         │    │  Spring Security│ │   WebSocket     │   │
+         │    │   JWT Auth      │ │   Real-time     │   │
          │    └─────────────────┘ └─────────────────┘   │
          │                                              │
          └──────────────────────────────────────────────┘
@@ -34,13 +34,15 @@
 - React Query (데이터 페칭)
 
 **Backend:**
-- Supabase (BaaS)
+- Java 17
+- Spring Boot 3.2
+- Spring Security 6
+- Spring Data JPA
 - PostgreSQL (데이터베이스)
-- Row Level Security (RLS)
-- Real-time Subscriptions
+- WebSocket (실시간 통신)
 
 **인증:**
-- Supabase Auth
+- Spring Security
 - JWT 토큰
 - Mock PASS 인증
 
@@ -210,208 +212,415 @@ CREATE TABLE notification_settings (
 
 #### 2.1 인증 API
 
-```typescript
-// Mock PASS 인증
-POST /api/auth/pass-verify
-{
-  "user_id": "uuid",
-  "verification_code": "string" // Mock 랜덤 코드
+```java
+// 회원가입
+@PostMapping("/api/auth/register")
+public ResponseEntity<AuthResponse> register(@RequestBody RegisterRequest request) {
+    // 사용자 등록 로직
 }
-Response: {
-  "success": boolean,
-  "verification_id": "string"
+
+// 로그인
+@PostMapping("/api/auth/login")
+public ResponseEntity<AuthResponse> login(@RequestBody LoginRequest request) {
+    // JWT 토큰 발급
+}
+
+// Mock PASS 인증
+@PostMapping("/api/auth/pass-verify")
+public ResponseEntity<PassVerificationResponse> verifyPass(
+    @RequestBody PassVerificationRequest request) {
+    // Mock 인증 처리
 }
 
 // Mock 주식 연동
-POST /api/auth/stock-link
-{
-  "user_id": "uuid",
-  "company_codes": ["005930", "000660"] // 선택적 기업 코드
+@PostMapping("/api/auth/stock-link")
+public ResponseEntity<StockLinkResponse> linkStock(
+    @RequestBody StockLinkRequest request,
+    @AuthenticationPrincipal UserPrincipal user) {
+    // 임의 주식 정보 생성 및 할당
 }
-Response: {
-  "success": boolean,
-  "stocks": [
-    {
-      "company_code": "005930",
-      "company_name": "삼성전자",
-      "shares_owned": 100
-    }
-  ]
+```
+
+**Request/Response DTOs:**
+```java
+public class RegisterRequest {
+    private String email;
+    private String password;
+    private String name;
+    private String phone;
+}
+
+public class AuthResponse {
+    private String accessToken;
+    private String refreshToken;
+    private UserDto user;
+}
+
+public class StockLinkResponse {
+    private boolean success;
+    private List<UserStockDto> stocks;
 }
 ```
 
 #### 2.2 Q&A API
 
-```typescript
-// Q&A 세션 목록 조회
-GET /api/qa/sessions?company_code=005930
-Response: {
-  "sessions": [
-    {
-      "id": "uuid",
-      "title": "2024년 3분기 실적발표 Q&A",
-      "status": "active",
-      "question_count": 15,
-      "start_date": "2024-01-15T10:00:00Z"
+```java
+@RestController
+@RequestMapping("/api/qa")
+@PreAuthorize("hasRole('USER')")
+public class QAController {
+    
+    // Q&A 세션 목록 조회
+    @GetMapping("/sessions")
+    public ResponseEntity<List<QASessionDto>> getSessions(
+        @RequestParam String companyCode,
+        @AuthenticationPrincipal UserPrincipal user) {
+        // 사용자가 주주인 기업의 세션만 조회
     }
-  ]
-}
-
-// 질문 제출
-POST /api/qa/questions
-{
-  "session_id": "uuid",
-  "content": "올해 매출 전망은 어떻게 되나요?"
-}
-
-// 질문 투표
-POST /api/qa/questions/:id/vote
-{
-  "vote_weight": 100 // 보유 주식 수
-}
-
-// 답변 작성 (관리자)
-POST /api/qa/answers
-{
-  "question_id": "uuid",
-  "content": "답변 내용",
-  "status": "published"
+    
+    // 질문 제출
+    @PostMapping("/questions")
+    @PreAuthorize("@securityService.isVerifiedShareholder(authentication.principal, #request.sessionId)")
+    public ResponseEntity<QuestionDto> submitQuestion(
+        @RequestBody SubmitQuestionRequest request,
+        @AuthenticationPrincipal UserPrincipal user) {
+        // 질문 제출 로직
+    }
+    
+    // 질문 투표
+    @PostMapping("/questions/{questionId}/vote")
+    @PreAuthorize("@securityService.canVoteOnQuestion(authentication.principal, #questionId)")
+    public ResponseEntity<VoteResponse> voteQuestion(
+        @PathVariable UUID questionId,
+        @AuthenticationPrincipal UserPrincipal user) {
+        // 보유 주식 수만큼 투표
+    }
+    
+    // 답변 작성 (관리자)
+    @PostMapping("/answers")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<AnswerDto> createAnswer(
+        @RequestBody CreateAnswerRequest request,
+        @AuthenticationPrincipal UserPrincipal admin) {
+        // 답변 작성 로직
+    }
 }
 ```
 
 #### 2.3 이벤트 API
 
-```typescript
-// 이벤트 생성 (관리자)
-POST /api/events
-{
-  "title": "2024년 정기주주총회",
-  "description": "연례 주주총회입니다",
-  "event_type": "agm",
-  "event_date": "2024-03-15T14:00:00Z",
-  "max_participants": 500
-}
-
-// 이벤트 참가 신청
-POST /api/events/:id/register
-{
-  "user_id": "uuid"
-}
-
-// 이벤트 중 질문 제출
-POST /api/events/:id/questions
-{
-  "content": "배당 정책에 대해 질문드립니다"
+```java
+@RestController
+@RequestMapping("/api/events")
+public class EventController {
+    
+    // 이벤트 생성 (관리자)
+    @PostMapping
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<EventDto> createEvent(
+        @RequestBody CreateEventRequest request,
+        @AuthenticationPrincipal UserPrincipal admin) {
+        // 이벤트 생성 로직
+    }
+    
+    // 이벤트 목록 조회
+    @GetMapping
+    @PreAuthorize("hasRole('USER')")
+    public ResponseEntity<List<EventDto>> getEvents(
+        @RequestParam(required = false) String companyCode,
+        @AuthenticationPrincipal UserPrincipal user) {
+        // 사용자가 참여 가능한 이벤트 목록
+    }
+    
+    // 이벤트 참가 신청
+    @PostMapping("/{eventId}/register")
+    @PreAuthorize("@securityService.canParticipateInEvent(authentication.principal, #eventId)")
+    public ResponseEntity<ParticipationResponse> registerForEvent(
+        @PathVariable UUID eventId,
+        @AuthenticationPrincipal UserPrincipal user) {
+        // 참가 신청 로직
+    }
+    
+    // 이벤트 중 질문 제출
+    @PostMapping("/{eventId}/questions")
+    @PreAuthorize("@securityService.isEventParticipant(authentication.principal, #eventId)")
+    public ResponseEntity<EventQuestionDto> submitEventQuestion(
+        @PathVariable UUID eventId,
+        @RequestBody SubmitEventQuestionRequest request,
+        @AuthenticationPrincipal UserPrincipal user) {
+        // 이벤트 질문 제출
+    }
 }
 ```
 
 ### 3. 실시간 기능 설계
 
-#### 3.1 Supabase Real-time 구독
+#### 3.1 WebSocket 구성
 
-```typescript
-// Q&A 실시간 업데이트
-const questionSubscription = supabase
-  .channel('questions')
-  .on('postgres_changes', {
-    event: 'INSERT',
-    schema: 'public',
-    table: 'questions',
-    filter: `session_id=eq.${sessionId}`
-  }, (payload) => {
-    // 새 질문 실시간 추가
-    updateQuestionList(payload.new);
-  })
-  .on('postgres_changes', {
-    event: 'UPDATE',
-    schema: 'public',
-    table: 'questions',
-    filter: `session_id=eq.${sessionId}`
-  }, (payload) => {
-    // 투표 수 실시간 업데이트
-    updateQuestionVotes(payload.new);
-  })
-  .subscribe();
+```java
+@Configuration
+@EnableWebSocket
+public class WebSocketConfig implements WebSocketConfigurer {
+    
+    @Override
+    public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
+        registry.addHandler(new QAWebSocketHandler(), "/ws/qa")
+                .addHandler(new NotificationWebSocketHandler(), "/ws/notifications")
+                .setAllowedOrigins("*")
+                .withSockJS();
+    }
+}
 
-// 알림 실시간 수신
-const notificationSubscription = supabase
-  .channel('notifications')
-  .on('postgres_changes', {
-    event: 'INSERT',
-    schema: 'public',
-    table: 'notifications',
-    filter: `user_id=eq.${userId}`
-  }, (payload) => {
-    showNotification(payload.new);
-  })
-  .subscribe();
+@Component
+public class QAWebSocketHandler extends TextWebSocketHandler {
+    
+    private final Map<String, Set<WebSocketSession>> sessionRooms = new ConcurrentHashMap<>();
+    
+    @Override
+    public void afterConnectionEstablished(WebSocketSession session) {
+        String sessionId = getSessionId(session);
+        sessionRooms.computeIfAbsent(sessionId, k -> ConcurrentHashMap.newKeySet())
+                   .add(session);
+    }
+    
+    public void broadcastNewQuestion(String sessionId, QuestionDto question) {
+        Set<WebSocketSession> sessions = sessionRooms.get(sessionId);
+        if (sessions != null) {
+            String message = createMessage("NEW_QUESTION", question);
+            sessions.forEach(session -> sendMessage(session, message));
+        }
+    }
+    
+    public void broadcastVoteUpdate(String sessionId, VoteUpdateDto voteUpdate) {
+        Set<WebSocketSession> sessions = sessionRooms.get(sessionId);
+        if (sessions != null) {
+            String message = createMessage("VOTE_UPDATE", voteUpdate);
+            sessions.forEach(session -> sendMessage(session, message));
+        }
+    }
+}
+
+@Service
+public class RealTimeService {
+    
+    @Autowired
+    private QAWebSocketHandler qaWebSocketHandler;
+    
+    @Autowired
+    private NotificationWebSocketHandler notificationHandler;
+    
+    @EventListener
+    public void handleQuestionCreated(QuestionCreatedEvent event) {
+        qaWebSocketHandler.broadcastNewQuestion(
+            event.getSessionId(), 
+            event.getQuestion()
+        );
+    }
+    
+    @EventListener
+    public void handleQuestionVoted(QuestionVotedEvent event) {
+        qaWebSocketHandler.broadcastVoteUpdate(
+            event.getSessionId(),
+            event.getVoteUpdate()
+        );
+    }
+    
+    @EventListener
+    public void handleNotificationCreated(NotificationCreatedEvent event) {
+        notificationHandler.sendNotificationToUser(
+            event.getUserId(),
+            event.getNotification()
+        );
+    }
+}
 ```
 
 ### 4. 보안 설계
 
-#### 4.1 Row Level Security (RLS) 정책
+#### 4.1 Spring Security 구성
 
-```sql
--- 프로필 접근 제한
-ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "Users can view own profile" ON profiles
-  FOR SELECT USING (auth.uid() = id);
-CREATE POLICY "Users can update own profile" ON profiles
-  FOR UPDATE USING (auth.uid() = id);
+```java
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity(prePostEnabled = true)
+public class SecurityConfig {
+    
+    @Autowired
+    private JwtAuthenticationEntryPoint jwtAuthenticationEntryPoint;
+    
+    @Autowired
+    private JwtRequestFilter jwtRequestFilter;
+    
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+    
+    @Bean
+    public AuthenticationManager authenticationManager(
+            AuthenticationConfiguration config) throws Exception {
+        return config.getAuthenticationManager();
+    }
+    
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http.csrf(csrf -> csrf.disable())
+            .authorizeHttpRequests(authz -> authz
+                .requestMatchers("/api/auth/**").permitAll()
+                .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                .requestMatchers("/api/**").hasRole("USER")
+                .anyRequest().authenticated()
+            )
+            .exceptionHandling(ex -> ex
+                .authenticationEntryPoint(jwtAuthenticationEntryPoint)
+            )
+            .sessionManagement(session -> session
+                .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+            );
+            
+        http.addFilterBefore(jwtRequestFilter, UsernamePasswordAuthenticationFilter.class);
+        
+        return http.build();
+    }
+}
 
--- 질문 접근 제한
-ALTER TABLE questions ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "Users can view questions in their company sessions" ON questions
-  FOR SELECT USING (
-    EXISTS (
-      SELECT 1 FROM user_stocks us
-      JOIN qa_sessions qs ON us.company_code = qs.company_code
-      WHERE us.user_id = auth.uid() AND qs.id = session_id
-    )
-  );
-
--- 관리자만 답변 작성 가능
-ALTER TABLE answers ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "Only admins can manage answers" ON answers
-  FOR ALL USING (
-    EXISTS (
-      SELECT 1 FROM admin_users au
-      WHERE au.user_id = auth.uid()
-    )
-  );
+@Component
+public class JwtRequestFilter extends OncePerRequestFilter {
+    
+    @Autowired
+    private UserDetailsService userDetailsService;
+    
+    @Autowired
+    private JwtTokenUtil jwtTokenUtil;
+    
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, 
+                                  HttpServletResponse response, 
+                                  FilterChain chain) throws ServletException, IOException {
+        
+        final String requestTokenHeader = request.getHeader("Authorization");
+        
+        String username = null;
+        String jwtToken = null;
+        
+        if (requestTokenHeader != null && requestTokenHeader.startsWith("Bearer ")) {
+            jwtToken = requestTokenHeader.substring(7);
+            try {
+                username = jwtTokenUtil.getUsernameFromToken(jwtToken);
+            } catch (IllegalArgumentException e) {
+                logger.error("Unable to get JWT Token");
+            } catch (ExpiredJwtException e) {
+                logger.error("JWT Token has expired");
+            }
+        }
+        
+        if (username != null && SecurityContextHolder.getContext().getAuthentication() == null) {
+            UserDetails userDetails = this.userDetailsService.loadUserByUsername(username);
+            
+            if (jwtTokenUtil.validateToken(jwtToken, userDetails)) {
+                UsernamePasswordAuthenticationToken authToken = 
+                    new UsernamePasswordAuthenticationToken(
+                        userDetails, null, userDetails.getAuthorities());
+                authToken.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+                SecurityContextHolder.getContext().setAuthentication(authToken);
+            }
+        }
+        chain.doFilter(request, response);
+    }
+}
 ```
 
-#### 4.2 JWT 토큰 검증
+#### 4.2 메서드 레벨 보안
 
-```typescript
-// 미들웨어에서 토큰 검증
-export async function middleware(request: NextRequest) {
-  const token = request.cookies.get('supabase-auth-token');
-  
-  if (!token) {
-    return NextResponse.redirect(new URL('/login', request.url));
-  }
-  
-  const { data: { user }, error } = await supabase.auth.getUser(token.value);
-  
-  if (error || !user) {
-    return NextResponse.redirect(new URL('/login', request.url));
-  }
-  
-  // 관리자 페이지 접근 제한
-  if (request.nextUrl.pathname.startsWith('/admin')) {
-    const { data: adminUser } = await supabase
-      .from('admin_users')
-      .select('*')
-      .eq('user_id', user.id)
-      .single();
-      
-    if (!adminUser) {
-      return NextResponse.redirect(new URL('/unauthorized', request.url));
+```java
+@Service
+public class SecurityService {
+    
+    @Autowired
+    private UserStockRepository userStockRepository;
+    
+    @Autowired
+    private QASessionRepository qaSessionRepository;
+    
+    @Autowired
+    private EventRepository eventRepository;
+    
+    public boolean isVerifiedShareholder(UserPrincipal user, UUID sessionId) {
+        QASession session = qaSessionRepository.findById(sessionId)
+            .orElseThrow(() -> new EntityNotFoundException("Session not found"));
+            
+        return userStockRepository.existsByUserIdAndCompanyCode(
+            user.getId(), session.getCompanyCode());
     }
-  }
-  
-  return NextResponse.next();
+    
+    public boolean canVoteOnQuestion(UserPrincipal user, UUID questionId) {
+        Question question = questionRepository.findById(questionId)
+            .orElseThrow(() -> new EntityNotFoundException("Question not found"));
+            
+        QASession session = question.getSession();
+        return isVerifiedShareholder(user, session.getId());
+    }
+    
+    public boolean canParticipateInEvent(UserPrincipal user, UUID eventId) {
+        Event event = eventRepository.findById(eventId)
+            .orElseThrow(() -> new EntityNotFoundException("Event not found"));
+            
+        return userStockRepository.existsByUserIdAndCompanyCode(
+            user.getId(), event.getCompanyCode());
+    }
+    
+    public boolean isEventParticipant(UserPrincipal user, UUID eventId) {
+        return eventParticipantRepository.existsByEventIdAndUserId(eventId, user.getId());
+    }
+}
+
+@Component
+public class JwtTokenUtil {
+    
+    private String secret = "mySecret";
+    private int jwtExpiration = 86400; // 24 hours
+    
+    public String getUsernameFromToken(String token) {
+        return getClaimFromToken(token, Claims::getSubject);
+    }
+    
+    public Date getExpirationDateFromToken(String token) {
+        return getClaimFromToken(token, Claims::getExpiration);
+    }
+    
+    public <T> T getClaimFromToken(String token, Function<Claims, T> claimsResolver) {
+        final Claims claims = getAllClaimsFromToken(token);
+        return claimsResolver.apply(claims);
+    }
+    
+    private Claims getAllClaimsFromToken(String token) {
+        return Jwts.parser().setSigningKey(secret).parseClaimsJws(token).getBody();
+    }
+    
+    private Boolean isTokenExpired(String token) {
+        final Date expiration = getExpirationDateFromToken(token);
+        return expiration.before(new Date());
+    }
+    
+    public String generateToken(UserDetails userDetails) {
+        Map<String, Object> claims = new HashMap<>();
+        return createToken(claims, userDetails.getUsername());
+    }
+    
+    private String createToken(Map<String, Object> claims, String subject) {
+        return Jwts.builder()
+                .setClaims(claims)
+                .setSubject(subject)
+                .setIssuedAt(new Date(System.currentTimeMillis()))
+                .setExpiration(new Date(System.currentTimeMillis() + jwtExpiration * 1000))
+                .signWith(SignatureAlgorithm.HS512, secret)
+                .compact();
+    }
+    
+    public Boolean validateToken(String token, UserDetails userDetails) {
+        final String username = getUsernameFromToken(token);
+        return (username.equals(userDetails.getUsername()) && !isTokenExpired(token));
+    }
 }
 ```
 
