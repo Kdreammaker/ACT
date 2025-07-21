@@ -2,7 +2,7 @@
 
 ## 개요
 
-본 문서는 IR-CSaaS MVP의 백엔드 중심 시스템 설계를 정의합니다. Java Spring Boot를 백엔드로, PostgreSQL을 데이터베이스로 활용하여 확장 가능한 엔터프라이즈급 아키텍처를 구현합니다.
+본 문서는 IR-CSaaS MVP의 백엔드 중심 시스템 설계를 정의합니다. Java Spring Boot를 백엔드로, Supabase를 데이터베이스 및 인프라로 활용하여 빠른 MVP 개발과 확장 가능한 아키텍처를 구현합니다.
 
 ## 아키텍처
 
@@ -10,7 +10,7 @@
 
 ```
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   Next.js App   │────│  Spring Boot API │────│   PostgreSQL    │
+│   Next.js App   │────│  Spring Boot API │────│    Supabase     │
 │   (Frontend)    │    │   (Backend)      │    │   (Database)    │
 └─────────────────┘    └──────────────────┘    └─────────────────┘
          │                       │                       │
@@ -18,7 +18,7 @@
          │              │                 │             │
          │              ▼                 ▼             │
          │    ┌─────────────────┐ ┌─────────────────┐   │
-         │    │  Spring Security│ │   WebSocket     │   │
+         │    │  Spring Security│ │   Supabase      │   │
          │    │   JWT Auth      │ │   Real-time     │   │
          │    └─────────────────┘ └─────────────────┘   │
          │                                              │
@@ -37,12 +37,12 @@
 - Java 17
 - Spring Boot 3.2
 - Spring Security 6
-- Spring Data JPA
-- PostgreSQL (데이터베이스)
-- WebSocket (실시간 통신)
+- Supabase Java Client
+- Supabase PostgreSQL (데이터베이스)
+- Supabase Real-time (실시간 통신)
 
 **인증:**
-- Spring Security
+- Spring Security + Supabase Auth
 - JWT 토큰
 - Mock PASS 인증
 
@@ -54,36 +54,60 @@
 
 ```sql
 -- 사용자 프로필 (Supabase Auth 확장)
-CREATE TABLE profiles (
+CREATE TABLE public.profiles (
   id UUID REFERENCES auth.users(id) PRIMARY KEY,
   email TEXT UNIQUE NOT NULL,
   name TEXT NOT NULL,
   phone TEXT,
   is_verified BOOLEAN DEFAULT FALSE,
-  pass_verified_at TIMESTAMP,
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
+  pass_verified_at TIMESTAMP WITH TIME ZONE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- RLS 정책 설정
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Users can view own profile" ON public.profiles
+  FOR SELECT USING (auth.uid() = id);
+CREATE POLICY "Users can update own profile" ON public.profiles
+  FOR UPDATE USING (auth.uid() = id);
+
 -- 주식 보유 정보 (Mock 데이터)
-CREATE TABLE user_stocks (
+CREATE TABLE public.user_stocks (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-  user_id UUID REFERENCES profiles(id) ON DELETE CASCADE,
+  user_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE,
   company_code TEXT NOT NULL, -- 기업 코드 (예: 005930)
   company_name TEXT NOT NULL, -- 기업명 (예: 삼성전자)
   shares_owned INTEGER NOT NULL DEFAULT 0,
-  verified_at TIMESTAMP DEFAULT NOW(),
-  created_at TIMESTAMP DEFAULT NOW()
+  verified_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- RLS 정책 설정
+ALTER TABLE public.user_stocks ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Users can view own stocks" ON public.user_stocks
+  FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Users can manage own stocks" ON public.user_stocks
+  FOR ALL USING (auth.uid() = user_id);
+
 -- 관리자 권한
-CREATE TABLE admin_users (
+CREATE TABLE public.admin_users (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-  user_id UUID REFERENCES profiles(id) ON DELETE CASCADE,
+  user_id UUID REFERENCES public.profiles(id) ON DELETE CASCADE,
   company_code TEXT NOT NULL,
   role TEXT NOT NULL DEFAULT 'ir_manager', -- ir_manager, ir_admin, ceo
-  created_at TIMESTAMP DEFAULT NOW()
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+-- RLS 정책 설정
+ALTER TABLE public.admin_users ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Admins can view admin users" ON public.admin_users
+  FOR SELECT USING (
+    EXISTS (
+      SELECT 1 FROM public.admin_users au 
+      WHERE au.user_id = auth.uid()
+    )
+  );
 ```
 
 #### 1.2 Q&A 시스템 테이블
@@ -355,82 +379,183 @@ public class EventController {
 
 ### 3. 실시간 기능 설계
 
-#### 3.1 WebSocket 구성
+#### 3.1 Supabase Real-time 통합
 
 ```java
 @Configuration
-@EnableWebSocket
-public class WebSocketConfig implements WebSocketConfigurer {
+public class SupabaseConfig {
     
-    @Override
-    public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
-        registry.addHandler(new QAWebSocketHandler(), "/ws/qa")
-                .addHandler(new NotificationWebSocketHandler(), "/ws/notifications")
-                .setAllowedOrigins("*")
-                .withSockJS();
-    }
-}
-
-@Component
-public class QAWebSocketHandler extends TextWebSocketHandler {
+    @Value("${supabase.url}")
+    private String supabaseUrl;
     
-    private final Map<String, Set<WebSocketSession>> sessionRooms = new ConcurrentHashMap<>();
+    @Value("${supabase.anon.key}")
+    private String supabaseAnonKey;
     
-    @Override
-    public void afterConnectionEstablished(WebSocketSession session) {
-        String sessionId = getSessionId(session);
-        sessionRooms.computeIfAbsent(sessionId, k -> ConcurrentHashMap.newKeySet())
-                   .add(session);
-    }
-    
-    public void broadcastNewQuestion(String sessionId, QuestionDto question) {
-        Set<WebSocketSession> sessions = sessionRooms.get(sessionId);
-        if (sessions != null) {
-            String message = createMessage("NEW_QUESTION", question);
-            sessions.forEach(session -> sendMessage(session, message));
-        }
-    }
-    
-    public void broadcastVoteUpdate(String sessionId, VoteUpdateDto voteUpdate) {
-        Set<WebSocketSession> sessions = sessionRooms.get(sessionId);
-        if (sessions != null) {
-            String message = createMessage("VOTE_UPDATE", voteUpdate);
-            sessions.forEach(session -> sendMessage(session, message));
-        }
+    @Bean
+    public SupabaseClient supabaseClient() {
+        return SupabaseClient.builder()
+                .supabaseUrl(supabaseUrl)
+                .supabaseKey(supabaseAnonKey)
+                .build();
     }
 }
 
 @Service
-public class RealTimeService {
+public class SupabaseRealTimeService {
     
     @Autowired
-    private QAWebSocketHandler qaWebSocketHandler;
+    private SupabaseClient supabaseClient;
     
     @Autowired
-    private NotificationWebSocketHandler notificationHandler;
+    private SimpMessagingTemplate messagingTemplate;
     
-    @EventListener
-    public void handleQuestionCreated(QuestionCreatedEvent event) {
-        qaWebSocketHandler.broadcastNewQuestion(
-            event.getSessionId(), 
-            event.getQuestion()
+    @PostConstruct
+    public void initializeRealTimeSubscriptions() {
+        // Q&A 질문 실시간 구독
+        supabaseClient.realtime()
+            .channel("questions")
+            .on("INSERT", this::handleQuestionInsert)
+            .on("UPDATE", this::handleQuestionUpdate)
+            .subscribe();
+            
+        // 알림 실시간 구독
+        supabaseClient.realtime()
+            .channel("notifications")
+            .on("INSERT", this::handleNotificationInsert)
+            .subscribe();
+    }
+    
+    private void handleQuestionInsert(RealtimePayload payload) {
+        QuestionDto question = mapToQuestionDto(payload.getNew());
+        
+        // WebSocket을 통해 클라이언트에 브로드캐스트
+        messagingTemplate.convertAndSend(
+            "/topic/qa/session/" + question.getSessionId(),
+            Map.of("type", "NEW_QUESTION", "data", question)
         );
     }
     
-    @EventListener
-    public void handleQuestionVoted(QuestionVotedEvent event) {
-        qaWebSocketHandler.broadcastVoteUpdate(
-            event.getSessionId(),
-            event.getVoteUpdate()
+    private void handleQuestionUpdate(RealtimePayload payload) {
+        QuestionDto question = mapToQuestionDto(payload.getNew());
+        
+        // 투표 수 업데이트 브로드캐스트
+        messagingTemplate.convertAndSend(
+            "/topic/qa/session/" + question.getSessionId(),
+            Map.of("type", "VOTE_UPDATE", "data", question)
         );
     }
     
-    @EventListener
-    public void handleNotificationCreated(NotificationCreatedEvent event) {
-        notificationHandler.sendNotificationToUser(
-            event.getUserId(),
-            event.getNotification()
+    private void handleNotificationInsert(RealtimePayload payload) {
+        NotificationDto notification = mapToNotificationDto(payload.getNew());
+        
+        // 특정 사용자에게 알림 전송
+        messagingTemplate.convertAndSendToUser(
+            notification.getUserId().toString(),
+            "/queue/notifications",
+            notification
         );
+    }
+}
+
+@Configuration
+@EnableWebSocketMessageBroker
+public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
+    
+    @Override
+    public void configureMessageBroker(MessageBrokerRegistry config) {
+        config.enableSimpleBroker("/topic", "/queue");
+        config.setApplicationDestinationPrefixes("/app");
+        config.setUserDestinationPrefix("/user");
+    }
+    
+    @Override
+    public void registerStompEndpoints(StompEndpointRegistry registry) {
+        registry.addEndpoint("/ws")
+                .setAllowedOriginPatterns("*")
+                .withSockJS();
+    }
+}
+
+@Service
+public class SupabaseService {
+    
+    @Autowired
+    private SupabaseClient supabaseClient;
+    
+    public List<QuestionDto> getQuestions(UUID sessionId) {
+        return supabaseClient.from("questions")
+                .select("*")
+                .eq("session_id", sessionId)
+                .order("vote_count", false)
+                .execute()
+                .getData()
+                .stream()
+                .map(this::mapToQuestionDto)
+                .collect(Collectors.toList());
+    }
+    
+    public QuestionDto createQuestion(CreateQuestionRequest request, UUID userId) {
+        Map<String, Object> questionData = Map.of(
+            "session_id", request.getSessionId(),
+            "user_id", userId,
+            "content", request.getContent(),
+            "status", "pending",
+            "vote_count", 0
+        );
+        
+        return supabaseClient.from("questions")
+                .insert(questionData)
+                .execute()
+                .getData()
+                .stream()
+                .findFirst()
+                .map(this::mapToQuestionDto)
+                .orElseThrow();
+    }
+    
+    public void voteQuestion(UUID questionId, UUID userId, int voteWeight) {
+        // 기존 투표 확인
+        boolean hasVoted = supabaseClient.from("question_votes")
+                .select("id")
+                .eq("question_id", questionId)
+                .eq("user_id", userId)
+                .execute()
+                .getData()
+                .size() > 0;
+                
+        if (!hasVoted) {
+            // 투표 추가
+            Map<String, Object> voteData = Map.of(
+                "question_id", questionId,
+                "user_id", userId,
+                "vote_weight", voteWeight
+            );
+            
+            supabaseClient.from("question_votes")
+                    .insert(voteData)
+                    .execute();
+            
+            // 질문의 총 투표 수 업데이트
+            updateQuestionVoteCount(questionId);
+        }
+    }
+    
+    private void updateQuestionVoteCount(UUID questionId) {
+        // 총 투표 수 계산
+        int totalVotes = supabaseClient.from("question_votes")
+                .select("vote_weight")
+                .eq("question_id", questionId)
+                .execute()
+                .getData()
+                .stream()
+                .mapToInt(row -> (Integer) row.get("vote_weight"))
+                .sum();
+        
+        // 질문 업데이트
+        supabaseClient.from("questions")
+                .update(Map.of("vote_count", totalVotes))
+                .eq("id", questionId)
+                .execute();
     }
 }
 ```
